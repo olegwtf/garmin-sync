@@ -97,7 +97,7 @@ if ($i >= 0) {
     my ($ok, $error) = login($ua, $cfg->{login}, $cfg->{password});
     unless ($ok) {
         do_log("Login failed: $error");
-        notify(0, "Login failed: $error");
+        notify(0, "Login failed", $error);
         exit 1;
     }
     
@@ -168,7 +168,7 @@ sub upload {
     
     my ($ext) = $file =~ /(\.[^.]+)$/;
     my $resp = $ua->post('https://connect.garmin.com/modern/proxy/upload-service/upload/' . $ext,
-        Content_Type => "form-data",
+        Content_Type => 'form-data',
         Content      => [file => [$file]],
         Referer      => 'https://connect.garmin.com/modern/import-data',
         NK           => 'NT',
