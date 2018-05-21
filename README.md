@@ -40,8 +40,7 @@ At this point you can connect your device to computer using USB cable, mount it 
     [Install]
     WantedBy=media-oleg-GARMIN.mount
     ```
-
-Replace `media-oleg-GARMIN.mount` with name of your device, which may be found with `sudo systemctl list-units -t mount`
+    Replace `media-oleg-GARMIN.mount` with name of your device, which may be found with `sudo systemctl list-units -t mount`
 3. Enable systemd service: `systemctl enable garmin.service --user`
 
 Next time you'll connect garmin device all new activities will be automatically uploaded to garmin connect.
