@@ -1,0 +1,198 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use JSON::PP;
+use LWP::UserAgent;
+use File::Path 'mkpath';
+use File::Basename;
+use Term::ReadKey;
+
+use constant APP_DIR => $ENV{HOME}.'/.config/garmin-sync';
+
+mkpath APP_DIR or die $! unless -e APP_DIR;
+my $cfg;
+if (-e APP_DIR.'/garmin-sync.json') {
+    $cfg = do {
+        local $/;
+        open my $fh, APP_DIR.'/garmin-sync.json';
+        <$fh>;
+    };
+    
+    $cfg = eval { decode_json($cfg) };
+}
+
+$cfg ||= {};
+
+my $ua = LWP::UserAgent->new(
+    agent      => 'Mozilla/5.0 (X11; Linux x86_64) Chrome/66.0.3359.117',
+    timeout    => 15,
+    cookie_jar => {},
+    parse_head => 0,
+);
+
+unless ( $cfg->{login} && $cfg->{password} && $cfg->{path} ) {
+    local $| = 1;
+    print "Configure garmin-sync before first run\n";
+    print "Enter your garmin connect login: ";
+    chomp($cfg->{login} = <>);
+    
+    Term::ReadKey::ReadMode('noecho');
+    print "Enter your garmin connect password (will not echo): ";
+    chomp($cfg->{password} = <>);
+    Term::ReadKey::ReadMode('restore');
+    
+    print "\nChecking credentials...\n";
+    my ($ok, $error) = login($ua, $cfg->{login}, $cfg->{password});
+    unless ($ok) {
+        die "Provided credentials are incorrect: $error\n";
+    }
+    
+    print "Enter path to directory with garmin activities: ";
+    chomp($cfg->{path} = <>);
+    unless (-d $cfg->{path}) {
+        die "directory should exists, did you connect your Garmin device?\n";
+    }
+    
+    my $last_mtime = 0;
+    my $activities = get_activities($cfg->{path});
+    if (@$activities) {
+        print "Last activity uploaded to garmin connect [".basename( $activities->[0]{f} )."]: ";
+        chomp(my $last_file = <>);
+        $last_file ||= basename( $activities->[0]{f} );
+        
+        for my $activity (@$activities) {
+            if ($last_file eq basename( $activity->{f} )) {
+                $last_mtime = $activity->{m};
+                last;
+            }
+        }
+        
+        die "No such activity file: $last_file\n" unless $last_mtime;
+    }
+    
+    open my $fh, '>', APP_DIR.'/last_uploaded_mtime' or die $!;
+    print $fh $last_mtime;
+    close $fh;
+    
+    open $fh, '>', APP_DIR.'/garmin-sync.json' or die $!;
+    print $fh encode_json($cfg);
+    close $fh;
+    chmod 0400, APP_DIR.'/garmin-sync.json';
+}
+
+my $last_mtime = do {
+    open my $fh, APP_DIR.'/last_uploaded_mtime';
+    <$fh> || 0;
+};
+
+my $activities = get_activities($cfg->{path});
+my $i = -1;
+for my $activity (@$activities) {
+    last if $activity->{m} <= $last_mtime;
+    $i++;
+}
+
+if ($i >= 0) {
+    my ($ok, $error) = login($ua, $cfg->{login}, $cfg->{password});
+    unless ($ok) {
+        do_log("Login failed: $error");
+        notify(0, "Login failed: $error");
+        exit 1;
+    }
+    
+    for (my $j=$i; $j>=0; $j--) {
+        ($ok, $error) = upload($ua, $activities->[$j]{f});
+        if ($ok) {
+            do_log("Successfully synced " . $activities->[$j]{f});
+            notify('face-smile', "Successfully synced " . basename($activities->[$j]{f}));
+        }
+        else {
+            do_log("Can't sync " . $activities->[$j]{f} . ": $error");
+            notify(0, "Can't sync " . basename($activities->[$j]{f}), $error);
+        }
+    }
+    
+    open my $fh, '>', APP_DIR.'/last_uploaded_mtime' or die $!;
+    print $fh $activities->[0]{m};
+    close $fh;
+}
+else {
+    notify('face-confused', 'No new activities to sync');
+}
+
+sub get_activities {
+    my $dir = shift;
+    
+    my @activities;
+    
+    opendir my $dh, $dir or die $!;
+    while (my $f = readdir $dh) {
+        if ($f ne '.' && $f ne '..' && -f "$dir/$f") {
+            $f = "$dir/$f";
+            push @activities, { 'f' => $f, 'm' => (stat $f)[9] };
+        }
+    }
+    
+    @activities = sort { $b->{m} <=> $a->{m} } @activities;
+    
+    return \@activities;
+}
+
+sub login {
+    my ($ua, $login, $password) = @_;
+    
+    my $resp = $ua->post('https://sso.garmin.com/sso/login?service=https%3A%2F%2Fconnect.garmin.com%2Fmodern%2F&webhost=https%3A%2F%2Fconnect.garmin.com&source=https%3A%2F%2Fconnect.garmin.com%2Fru-RU%2Fsignin&redirectAfterAccountLoginUrl=https%3A%2F%2Fconnect.garmin.com%2Fmodern%2F&redirectAfterAccountCreationUrl=https%3A%2F%2Fconnect.garmin.com%2Fmodern%2F&gauthHost=https%3A%2F%2Fsso.garmin.com%2Fsso&locale=ru_RU&id=gauth-widget&cssUrl=https%3A%2F%2Fstatic.garmincdn.com%2Fcom.garmin.connect%2Fui%2Fcss%2Fgauth-custom-v1.2-min.css&privacyStatementUrl=%2F%2Fconnect.garmin.com%2Fru-RU%2Fprivacy%2F&clientId=GarminConnect&rememberMeShown=true&rememberMeChecked=false&createAccountShown=true&openCreateAccount=false&displayNameShown=false&consumeServiceTicket=false&initialFocus=true&embedWidget=false&generateExtraServiceTicket=false&generateNoServiceTicket=false&globalOptInShown=true&globalOptInChecked=false&mobile=false&connectLegalTerms=true&locationPromptShown=true', [
+        username => $login,
+        password => $password,
+        embed    => 'false',
+    ]);
+    
+    $resp->is_success
+        or return (0, $resp->status_line . ' (/login)');
+    
+    my ($ticket) = $resp->decoded_content =~ /ticket=([^"]+)/
+        or return (0, 'no id found');
+    
+    $resp = $ua->get("https://connect.garmin.com/modern/?ticket=$ticket");
+    $resp->is_success
+        or return (0, $resp->status_line . ' (/modern)');
+    $resp->base !~ /signin/
+        or return (0, 'something went wrong');
+    
+    return 1;
+}
+
+sub upload {
+    my ($ua, $file) = @_;
+    
+    my ($ext) = $file =~ /(\.[^.]+)$/;
+    my $resp = $ua->post('https://connect.garmin.com/modern/proxy/upload-service/upload/' . $ext,
+        Content_Type => "form-data",
+        Content      => [file => [$file]],
+        Referer      => 'https://connect.garmin.com/modern/import-data',
+        NK           => 'NT',
+    );
+    
+    my $failure = eval { decode_json($resp->decoded_content)->{detailedImportResult}{failures}[0]{messages}[0]{content} };
+    unless ($resp->is_success) {
+        return (0, $resp->status_line . ( $failure ? " ($failure)" : '' ));
+    }
+    
+    if ($failure) {
+        return (0, $failure);
+    }
+    
+    return 1;
+}
+
+sub do_log {
+    open my $fh, '>>', APP_DIR . '/sync.log' or die $!;
+    print $fh '[', scalar(localtime), '] ', $_[0], "\n";
+    close $fh;
+}
+
+sub notify {
+    my ($success, $summary, $body) = @_;
+    system 'notify-send', '-i', $success ? $success : 'face-angry', (!$success ? ('-t', 1000*60*60) : ()), $summary, $body||'';
+}
