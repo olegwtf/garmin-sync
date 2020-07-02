@@ -48,31 +48,41 @@ unless ( $cfg->{login} && $cfg->{password} && $cfg->{path} ) {
         die "Provided credentials are incorrect: $error\n";
     }
     
-    print "Enter path to directory with garmin activities: ";
-    chomp($cfg->{path} = <>);
-    unless (-d $cfg->{path}) {
-        die "directory should exists, did you connect your Garmin device?\n";
-    }
-    
-    my $last_mtime = 0;
-    my $activities = get_activities($cfg->{path});
-    if (@$activities) {
-        print "Last activity uploaded to garmin connect [".basename( $activities->[0]{f} )."]: ";
-        chomp(my $last_file = <>);
-        $last_file ||= basename( $activities->[0]{f} );
-        
-        for my $activity (@$activities) {
-            if ($last_file eq basename( $activity->{f} )) {
-                $last_mtime = $activity->{m};
-                last;
-            }
+    my %mtime;
+    while (1) {
+        print "Enter path to directory with garmin activities: ";
+        chomp(my $directory = <>);
+        unless (-d $directory) {
+            die "directory should exists, did you connect your Garmin device?\n";
         }
-        
-        die "No such activity file: $last_file\n" unless $last_mtime;
+
+        my $last_mtime = 0;
+        my $activities = get_activities([$directory]);
+        if (@{$activities->{$directory}}) {
+            print "Last activity uploaded to garmin connect [".basename( $activities->{$directory}[0]{f} )."]: ";
+            chomp(my $last_file = <>);
+            $last_file ||= basename( $activities->{$directory}[0]{f} );
+
+            for my $activity (@{$activities->{$directory}}) {
+                if ($last_file eq basename( $activity->{f} )) {
+                    $last_mtime = $activity->{m};
+                    last;
+                }
+            }
+
+            die "No such activity file: $last_file\n" unless $last_mtime;
+        }
+
+        $mtime{$directory} = $last_mtime;
+        push @{$cfg->{path}}, $directory;
+
+        print "Want to add one more directory? (y/n):\n";
+        chomp(my $yesno = <>);
+        last unless $yesno eq 'y';
     }
     
-    open my $fh, '>', APP_DIR.'/last_uploaded_mtime' or die $!;
-    print $fh $last_mtime;
+    open my $fh, '>', APP_DIR.'/last_uploaded_mtime.json' or die $!;
+    print $fh encode_json(\%mtime);
     close $fh;
     
     open $fh, '>', APP_DIR.'/garmin-sync.json' or die $!;
@@ -81,19 +91,14 @@ unless ( $cfg->{login} && $cfg->{password} && $cfg->{path} ) {
     chmod 0400, APP_DIR.'/garmin-sync.json';
 }
 
-my $last_mtime = do {
-    open my $fh, APP_DIR.'/last_uploaded_mtime';
-    <$fh> || 0;
-};
+my $last_mtime = decode_json(do {
+    open my $fh, APP_DIR.'/last_uploaded_mtime.json';
+    <$fh> || '{}';
+});
 
-my $activities = get_activities($cfg->{path});
-my $i = -1;
-for my $activity (@$activities) {
-    last if $activity->{m} <= $last_mtime;
-    $i++;
-}
+my $activities = get_activities($cfg->{path}, $last_mtime);
 
-if ($i >= 0) {
+if (%$activities) {
     my ($ok, $error) = login($ua, $cfg->{login}, $cfg->{password});
     unless ($ok) {
         do_log("Login failed: $error");
@@ -101,20 +106,26 @@ if ($i >= 0) {
         exit 1;
     }
     
-    for (my $j=$i; $j>=0; $j--) {
-        ($ok, $error) = upload($ua, $activities->[$j]{f});
-        if ($ok) {
-            do_log("Successfully synced " . $activities->[$j]{f});
-            notify('face-smile', "Successfully synced " . basename($activities->[$j]{f}));
-        }
-        else {
-            do_log("Can't sync " . $activities->[$j]{f} . ": $error");
-            notify(0, "Can't sync " . basename($activities->[$j]{f}), $error);
+    while (my ($dir, $activities) = each %$activities) {
+        for my $activity (@$activities) {
+            ($ok, $error) = upload($ua, $activity->{f});
+            if ($ok) {
+                if (!$last_mtime->{$dir} || $activity->{m} > $last_mtime->{$dir}) {
+                    $last_mtime->{$dir} = $activity->{m};
+                }
+
+                do_log("Successfully synced " . $activity->{f});
+                notify('face-smile', "Successfully synced " . basename($activity->{f}));
+            }
+            else {
+                do_log("Can't sync " . $activity->{f} . ": $error");
+                notify(0, "Can't sync " . basename($activity->{f}), $error);
+            }
         }
     }
     
-    open my $fh, '>', APP_DIR.'/last_uploaded_mtime' or die $!;
-    print $fh $activities->[0]{m};
+    open my $fh, '>', APP_DIR.'/last_uploaded_mtime.json' or die $!;
+    print $fh encode_json($last_mtime);
     close $fh;
 }
 else {
@@ -122,21 +133,31 @@ else {
 }
 
 sub get_activities {
-    my $dir = shift;
+    my ($dir_list, $last_mtime) = @_;
     
-    my @activities;
+    my %activities;
     
-    opendir my $dh, $dir or die $!;
-    while (my $f = readdir $dh) {
-        if ($f ne '.' && $f ne '..' && -f "$dir/$f") {
-            $f = "$dir/$f";
-            push @activities, { 'f' => $f, 'm' => (stat $f)[9] };
+    for my $dir (@$dir_list) {
+        opendir my $dh, $dir or next;
+        while (my $f = readdir $dh) {
+            if ($f ne '.' && $f ne '..' && -f "$dir/$f") {
+                $f = "$dir/$f";
+                my $mtime = (stat $f)[9];
+
+                if ($last_mtime && ($last_mtime->{$dir} || 0) >= $mtime) {
+                    next;
+                }
+
+                push @{$activities{$dir}}, { 'f' => $f, 'm' => $mtime };
+            }
         }
+
+        @{$activities{$dir}} = sort { $b->{m} <=> $a->{m} } @{$activities{$dir}} if $activities{$dir};
     }
     
-    @activities = sort { $b->{m} <=> $a->{m} } @activities;
+
     
-    return \@activities;
+    return \%activities;
 }
 
 sub login {

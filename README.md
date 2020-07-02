@@ -47,4 +47,4 @@ Next time you'll connect garmin device all new activities will be automatically 
 
 ## How detection of new activities works
 
-First of all it will never remove activities from watched directory. To find new activities it stores modification time of newest activity from last run in `~/.config/garmin-sync/last_uploaded_mtime`. You can modify this time manually if you ever need.
+First of all it will never remove activities from watched directory. To find new activities it stores modification time of newest activity from last run in `~/.config/garmin-sync/last_uploaded_mtime.json`. You can modify this time manually if you ever need.
