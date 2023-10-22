@@ -31,23 +31,24 @@ my $ua = LWP::UserAgent->new(
     parse_head => 0,
 );
 
-unless ( $cfg->{login} && $cfg->{password} && $cfg->{path} ) {
+unless ( $cfg->{client_id} && $cfg->{client_secret} && $cfg->{refresh_token} && $cfg->{path} ) {
     local $| = 1;
     print "Configure garmin-sync before first run\n";
-    print "Enter your garmin connect login: ";
-    chomp($cfg->{login} = <>);
+    print "Enter your strava API client ID: ";
+    chomp($cfg->{client_id} = <>);
     
     Term::ReadKey::ReadMode('noecho');
-    print "Enter your garmin connect password (will not echo): ";
-    chomp($cfg->{password} = <>);
+    print "Enter your strava API client secret (will not echo): ";
+    chomp($cfg->{client_secret} = <>);
     Term::ReadKey::ReadMode('restore');
     
-    print "\nChecking credentials...\n";
-    my ($ok, $error) = login($ua, $cfg->{login}, $cfg->{password});
-    unless ($ok) {
-        die "Provided credentials are incorrect: $error\n";
-    }
-    
+    print "\nEnter your strava API refresh_token with activity:write permission (https://yizeng.me/2017/01/11/get-a-strava-api-access-token-with-write-permission/): ";
+    chomp($cfg->{refresh_token} = <>);
+
+    print "Checking credentials...\n";
+    refresh_token($ua, $cfg);
+    print "OK\n";
+
     my %mtime;
     while (1) {
         print "Enter path to directory with garmin activities: ";
@@ -85,10 +86,8 @@ unless ( $cfg->{login} && $cfg->{password} && $cfg->{path} ) {
     print $fh encode_json(\%mtime);
     close $fh;
     
-    open $fh, '>', APP_DIR.'/garmin-sync.json' or die $!;
-    print $fh encode_json($cfg);
-    close $fh;
-    chmod 0400, APP_DIR.'/garmin-sync.json';
+    save_config($cfg);
+    chmod 0600, APP_DIR.'/garmin-sync.json';
 }
 
 my $last_mtime = decode_json(do {
@@ -99,17 +98,9 @@ my $last_mtime = decode_json(do {
 my $activities = get_activities($cfg->{path}, $last_mtime);
 
 if (%$activities) {
-    my ($ok, $error) = login($ua, $cfg->{login}, $cfg->{password});
-    unless ($ok) {
-        do_log("Login failed: $error");
-        notify(0, "Login failed", $error);
-        exit 1;
-    }
-    
     while (my ($dir, $activities) = each %$activities) {
         for my $activity (@$activities) {
-            ($ok, $error) = upload($ua, $activity->{f});
-            if ($ok) {
+            if (eval { upload($ua, $activity->{f}, $cfg) }) {
                 if (!$last_mtime->{$dir} || $activity->{m} > $last_mtime->{$dir}) {
                     $last_mtime->{$dir} = $activity->{m};
                 }
@@ -118,6 +109,7 @@ if (%$activities) {
                 notify('face-smile', "Successfully synced " . basename($activity->{f}));
             }
             else {
+                my $error = $@;
                 do_log("Can't sync " . $activity->{f} . ": $error");
                 notify(0, "Can't sync " . basename($activity->{f}), $error);
             }
@@ -160,62 +152,61 @@ sub get_activities {
     return \%activities;
 }
 
-sub login {
-    my ($ua, $login, $password) = @_;
-    
-    my $url = 'https://sso.garmin.com/sso/signin?service=https%3A%2F%2Fconnect.garmin.com%2Fmodern%2F&webhost=https%3A%2F%2Fconnect.garmin.com%2Fmodern%2F&source=https%3A%2F%2Fconnect.garmin.com%2Fsignin&redirectAfterAccountLoginUrl=https%3A%2F%2Fconnect.garmin.com%2Fmodern%2F&redirectAfterAccountCreationUrl=https%3A%2F%2Fconnect.garmin.com%2Fmodern%2F&gauthHost=https%3A%2F%2Fsso.garmin.com%2Fsso&locale=ru_RU&id=gauth-widget&cssUrl=https%3A%2F%2Fconnect.garmin.com%2Fgauth-custom-v1.2-min.css&privacyStatementUrl=https%3A%2F%2Fwww.garmin.com%2Fru-RU%2Fprivacy%2Fconnect%2F&clientId=GarminConnect&rememberMeShown=true&rememberMeChecked=false&createAccountShown=true&openCreateAccount=false&displayNameShown=false&consumeServiceTicket=false&initialFocus=true&embedWidget=false&generateExtraServiceTicket=true&generateTwoExtraServiceTickets=true&generateNoServiceTicket=false&globalOptInShown=true&globalOptInChecked=false&mobile=false&connectLegalTerms=true&showTermsOfUse=false&showPrivacyPolicy=false&showConnectLegalAge=false&locationPromptShown=true&showPassword=true&useCustomHeader=false&mfaRequired=false&rememberMyBrowserShown=false&rememberMyBrowserChecked=false';
-    
-    my $resp = $ua->get($url);
-    my ($csrf) = $resp->decoded_content =~ /name="_csrf"\s+value="([^"]+)"/
-        or return (0, 'no csrf token found');
-    
-    $resp = $ua->post(
-        $url,
-        [
-            username => $login,
-            password => $password,
-            embed    => 'false',
-            _csrf    => $csrf,
-        ],
-        Referer => $url
+sub refresh_token {
+    my ($ua, $cfg) = @_;
+
+    my $resp = $ua->post(
+        'https://www.strava.com/api/v3/oauth/token',
+        Content => {
+            client_id     => $cfg->{client_id},
+            client_secret => $cfg->{client_secret},
+            grant_type    => 'refresh_token',
+            refresh_token => $cfg->{refresh_token}
+        }
     );
-    
-    $resp->is_success
-        or return (0, $resp->status_line . ' (/login)');
-    
-    my ($ticket) = $resp->decoded_content =~ /ticket=([^"]+)/
-        or return (0, 'no id found');
-    
-    $resp = $ua->get("https://connect.garmin.com/modern/?ticket=$ticket");
-    $resp->is_success
-        or return (0, $resp->status_line . ' (/modern)');
-    $resp->base !~ /signin/
-        or return (0, 'something went wrong');
-    
-    return 1;
+
+    $resp->is_success or die $resp->status_line, "\n", $resp->decoded_content, "\n";
+
+    my $res = decode_json( $resp->decoded_content );
+    $res->{access_token} && $res->{expires_at} && $res->{refresh_token}
+        or die 'Invalid response: ', $resp->decoded_content;
+
+    @$cfg{qw/ access_token expires_at refresh_token /} = @$res{qw/ access_token expires_at refresh_token /};
+}
+
+sub save_config {
+    my ( $cfg ) = @_;
+
+    open my $fh, '>', APP_DIR.'/garmin-sync.json' or die $!;
+    print $fh encode_json($cfg);
+    close $fh;
 }
 
 sub upload {
-    my ($ua, $file) = @_;
+    my ($ua, $file, $cfg) = @_;
     
-    my ($ext) = $file =~ /(\.[^.]+)$/;
-    my $resp = $ua->post('https://connect.garmin.com/modern/proxy/upload-service/upload/' . $ext,
+    my ($ext) = $file =~ /\.([^.]+)$/;
+
+    if ( time - $cfg->{expires_at} < 3 * 60 ) {
+        refresh_token($ua, $cfg);
+        save_config($cfg);
+    }
+
+    my $resp = $ua->post('https://www.strava.com/api/v3/uploads',
         Content_Type => 'form-data',
-        Content      => [file => [$file]],
-        Referer      => 'https://connect.garmin.com/modern/import-data',
-        NK           => 'NT',
+        Content      => [
+            file        => [$file],
+            name        => '',
+            description => '',
+            trainer     => '',
+            commute     => '',
+            data_type   => $ext,
+            external_id => '',
+        ],
+        Authorization => "Bearer $cfg->{access_token}"
     );
     
-    my $failure = eval { decode_json($resp->decoded_content)->{detailedImportResult}{failures}[0]{messages}[0]{content} };
-    unless ($resp->is_success) {
-        return (0, $resp->status_line . ( $failure ? " ($failure)" : '' ));
-    }
-    
-    if ($failure) {
-        return (0, $failure);
-    }
-    
-    return 1;
+    $resp->is_success or die $resp->status_line, "\n", $resp->decoded_content, "\n";
 }
 
 sub do_log {
