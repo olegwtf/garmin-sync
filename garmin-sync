@@ -165,7 +165,7 @@ sub refresh_token {
         }
     );
 
-    $resp->is_success or die $resp->status_line, "\n", $resp->decoded_content, "\n";
+    $resp->is_success or die "Error while refreshing token:\n", $resp->status_line, "\n", $resp->decoded_content, "\n";
 
     my $res = decode_json( $resp->decoded_content );
     $res->{access_token} && $res->{expires_at} && $res->{refresh_token}
@@ -187,7 +187,7 @@ sub upload {
     
     my ($ext) = $file =~ /\.([^.]+)$/;
 
-    if ( time - $cfg->{expires_at} < 3 * 60 ) {
+    if ( $cfg->{expires_at} - time < 3 * 60 ) {
         refresh_token($ua, $cfg);
         save_config($cfg);
     }
@@ -201,12 +201,12 @@ sub upload {
             trainer     => '',
             commute     => '',
             data_type   => $ext,
-            external_id => '',
+            external_id => int(rand 1_000_000),
         ],
         Authorization => "Bearer $cfg->{access_token}"
     );
     
-    $resp->is_success or die $resp->status_line, "\n", $resp->decoded_content, "\n";
+    $resp->is_success or die "Error while uploading:\n", $resp->status_line, "\n", $resp->decoded_content, "\n";
 }
 
 sub do_log {
