@@ -26,7 +26,7 @@ At this point you can connect your device to computer using USB cable, mount it 
 1. First of all you need to make your device mount automatically when it is connected to computer. For example in KDE I can do this in systemsettings:
 `Removable storage -> Removable devices -> Enable automatic mounting of removable media -> select your device`.
 2. Then we need to create new systemd service which will execute `garmin-sync` when our device is mounted:
-    * run `systemctl edit garmin.service --force --user` from your normal user
+    * run `systemctl edit garmin.service --force --user --full` from your normal user
     * and create such unit file:
     ```
     [Unit]
